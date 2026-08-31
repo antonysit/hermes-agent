@@ -995,8 +995,8 @@ class ResponseStore:
 # ---------------------------------------------------------------------------
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS, PATCH",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Session-Id, X-Hermes-Session-Key",
 }
 
 
@@ -2353,6 +2353,33 @@ class APIServerAdapter(BasePlatformAdapter):
         if re.search(r"[\r\n\x00]", text):
             return ""
         return text
+
+    @staticmethod
+    def _provider_lock_match(expected: str, actual: str) -> bool:
+        """Whether a confirmed lock's expected provider matches the runtime's.
+
+        Named ``providers:`` / ``custom_providers:`` entries resolve to the
+        billing class ``custom`` at runtime (and ``custom:<name>`` once the
+        upstream naming-preservation fix lands), while the lock stores the
+        config entry name (e.g. ``z-ai-code``). Without normalization every
+        confirmed lock on a custom provider false-positives after a successful
+        turn ("confirmed model lock runtime mismatch"). Accept the runtime's
+        class/slug forms when the expected name is itself a custom provider;
+        keep the strict comparison for non-custom providers.
+        """
+        e = expected.strip().lower()
+        a = actual.strip().lower()
+        if a == e:
+            return True
+        if a == f"custom:{e}":
+            return True
+        if a == "custom":
+            try:
+                from hermes_cli.runtime_provider import _get_named_custom_provider
+                return _get_named_custom_provider(e) is not None
+            except Exception:
+                return False
+        return False
 
     @classmethod
     def _split_provider_prefixed_model(cls, model: str) -> tuple[str, str]:
@@ -4091,11 +4118,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 name, payload = item
                 await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            await self._drain_session_stream_task_on_disconnect(
-                run_id, task, interrupt_message="SSE client disconnected", shield_wait=False
+            # A dropped SSE connection is only a dead transport, not a stop
+            # signal: the session endpoint always persists to state.db, so
+            # leave the agent running server-side and drain the now-unread
+            # queue (ref issue #15026 — for persisted turns, SSE is only a
+            # transport and disconnect must not cancel execution). The Stop
+            # button interrupts explicitly via POST /v1/runs/{run_id}/stop.
+            await self._detach_session_stream_task_on_disconnect(run_id, queue)
+            logger.info(
+                "Session SSE client disconnected; detached live run %s "
+                "(stop via /v1/runs/%s/stop)",
+                run_id,
+                run_id,
             )
-            logger.info("Session SSE client disconnected; interrupted live run %s", run_id)
         except asyncio.CancelledError:
+            # Task cancellation (server shutdown) still interrupts: the gateway
+            # is going away, so letting the turn finish is pointless.
             await self._drain_session_stream_task_on_disconnect(
                 run_id, task, interrupt_message="SSE task cancelled", shield_wait=True
             )
@@ -4126,6 +4164,37 @@ class APIServerAdapter(BasePlatformAdapter):
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
+
+    async def _detach_session_stream_task_on_disconnect(
+        self,
+        run_id: str,
+        queue: "asyncio.Queue",
+    ) -> None:
+        """Detach a client-disconnected session stream without interrupting it.
+
+        The session endpoint always persists to state.db, so a dropped SSE
+        connection is only a dead transport, not a stop signal (ref issue
+        #15026). The agent turn runs in ``_run_and_signal`` — already a
+        ``_background_tasks`` member independent of this handler — and keeps
+        producing events into *queue*. Drain those events until the end
+        sentinel so they don't accumulate in memory for the remainder of the
+        turn. The Stop button halts a detached run via
+        ``POST /v1/runs/{run_id}/stop``.
+        """
+
+        async def _drain() -> None:
+            with suppress(Exception):
+                while True:
+                    if await queue.get() is None:
+                        break
+
+        drain_task = asyncio.create_task(_drain())
+        try:
+            self._background_tasks.add(drain_task)
+        except TypeError:
+            pass
+        if hasattr(drain_task, "add_done_callback"):
+            drain_task.add_done_callback(self._background_tasks.discard)
 
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
@@ -6485,7 +6554,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 or (requested_runtime or {}).get("model")
                             )
                             mismatched = (
-                                (expected_provider and actual_provider != expected_provider)
+                                (expected_provider and not self._provider_lock_match(expected_provider, actual_provider))
                                 or (expected_model and actual_model != expected_model)
                             )
                             if mismatched:
@@ -7128,14 +7197,16 @@ class APIServerAdapter(BasePlatformAdapter):
         q = self._run_streams[run_id]
         self._run_stream_subscribers.add(run_id)
 
-        response = web.StreamResponse(
-            status=200,
-            headers={
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        _run_sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        _run_origin = request.headers.get("Origin", "")
+        _run_cors = self._cors_headers_for_origin(_run_origin) if _run_origin else None
+        if _run_cors:
+            _run_sse_headers.update(_run_cors)
+        response = web.StreamResponse(status=200, headers=_run_sse_headers)
         await response.prepare(request)
 
         try:
