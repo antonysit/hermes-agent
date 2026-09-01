@@ -207,10 +207,16 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_finishes(
+async def test_session_chat_stream_disconnect_detaches_without_interrupt(
     adapter, session_db
 ):
-    """Disconnects must interrupt the live run without dropping its control refs early."""
+    """A client disconnect detaches the turn instead of interrupting it.
+
+    The session endpoint always persists to state.db, so a dropped SSE
+    connection is only a dead transport (ref #15026). The agent keeps running
+    server-side and its run stays registered for /v1/runs/{run_id}/stop until
+    the executor-backed turn actually finishes.
+    """
     session_id = session_db.create_session("disconnect-stream-session", "api_server")
     run_started = threading.Event()
     interrupt_called = threading.Event()
@@ -279,21 +285,25 @@ async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_
         assert run_started.is_set()
         run_id = next(iter(adapter._run_statuses))
 
-        for _ in range(40):
-            if interrupt_called.is_set():
-                break
-            await asyncio.sleep(0.05)
+        # The disconnect makes the handler detach and return promptly, but must
+        # NOT interrupt the agent.
+        await asyncio.wait_for(handler_task, timeout=5)
+        assert not interrupt_called.is_set()
 
-        assert interrupt_called.is_set()
+        # The run stays registered while the agent is still running, so
+        # /v1/runs/{run_id}/stop can still halt it.
         assert run_id in adapter._active_run_agents
         # Not in _active_run_tasks: session-stream turns are counted via
         # _inflight_agent_runs; a task entry would double-count them in the
         # shutdown drain (active_agent_work_count).
         assert run_id not in adapter._active_run_tasks
-        assert not handler_task.done()
 
+        # Let the detached turn finish and confirm the control ref is released.
         allow_finish.set()
-        await handler_task
+        for _ in range(60):
+            if run_id not in adapter._active_run_agents:
+                break
+            await asyncio.sleep(0.05)
 
     assert run_id not in adapter._active_run_agents
 
