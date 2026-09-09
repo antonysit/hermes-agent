@@ -363,6 +363,9 @@ class TestAgentExecution:
         mock_agent.session_prompt_tokens = 1
         mock_agent.session_completion_tokens = 2
         mock_agent.session_total_tokens = 3
+        # PR #87418: the usage block now carries the context gauge too
+        mock_agent.context_compressor.last_prompt_tokens = 17915
+        mock_agent.context_compressor.context_length = 272000
 
         model_options = {"reasoning": {"enabled": False}, "fast": False}
         with patch.object(adapter, "_create_agent", return_value=mock_agent) as mock_create_agent:
@@ -381,7 +384,13 @@ class TestAgentExecution:
         # here doesn't set an explicit session_id string so the guard skips
         # the annotation — header will fall back to the provided session_id.
         assert result["final_response"] == "ok"
-        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        assert usage == {
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "total_tokens": 3,
+            "context_tokens": 17915,
+            "context_window": 272000,
+        }
         create_kwargs = mock_create_agent.call_args.kwargs
         assert create_kwargs["requested_model"] == "MiniMax-M3"
         assert create_kwargs["requested_provider"] == "minimax"
