@@ -928,6 +928,71 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_epoch = None
 
 
+def _turn_usage_fields(
+    agent: Any, messages: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, int]:
+    """The ``usage`` block of a finished turn: what it cost, how full it is.
+
+    ``input_tokens``/``output_tokens``/``total_tokens`` are cumulative over
+    every API call the turn made, so they answer "what did this turn cost",
+    not "how full is the context" — a long tool-using turn reports several
+    times the window. Remote clients that draw the same gauge as ``/context``
+    and the TUI status bar need two more numbers, the ones those read:
+
+    * ``context_tokens`` — the usage-anchored context size
+      (``anchored_context_tokens``): the last provider response's exact
+      ``prompt_tokens + completion_tokens`` plus a delta estimate of only
+      the messages appended since. This is the same figure
+      ``agent/context_breakdown.py`` now prefers for ``/context`` and the
+      status bar, so a remote gauge reads what a local user sees. Callers
+      pass the finished turn's live ``result["messages"]`` list — the
+      anchor validates against message identity, so a copy would not do.
+      When the anchor is missing or stale (usage-less providers, a
+      compression that just reset it), the figure falls back to the
+      compressor's ``last_prompt_tokens`` — the prompt size of the most
+      recent model call, which compression parks at 0 (or the Codex
+      runtime's ``-1`` sentinel); both clamp to 0 here, exactly as the
+      status bar shows them.
+    * ``context_window`` — the compressor's resolved ``context_length``, the
+      denominator that same code divides by. ``/api/model/info`` cannot
+      stand in for it: that route lives on the dashboard server, not here.
+
+    The two context fields are 0 when the agent exposes no compressor and no
+    valid anchor, so a client can tell "unknown" from a genuinely empty
+    context.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+
+    def _as_int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    anchored: Optional[int] = None
+    try:
+        from agent.model_metadata import anchored_context_tokens
+
+        anchored = anchored_context_tokens(
+            messages if isinstance(messages, list) else [],
+            getattr(agent, "_usage_anchor", None),
+        )
+    except Exception:
+        anchored = None
+    if anchored is not None:
+        context_tokens = _as_int(anchored)
+    else:
+        context_tokens = _as_int(getattr(compressor, "last_prompt_tokens", 0))
+
+    return {
+        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+        "context_tokens": context_tokens,
+        "context_window": _as_int(getattr(compressor, "context_length", 0)),
+    }
+
+
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
@@ -7561,11 +7626,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
-                    usage = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
+                    usage = _turn_usage_fields(
+                        agent,
+                        messages=result.get("messages")
+                        if isinstance(result, dict)
+                        else None,
+                    )
                     # Include the effective session ID in the result so callers
                     # (e.g. X-Hermes-Session-Id header) can track compression-
                     # triggered session rotations. (#16938)
