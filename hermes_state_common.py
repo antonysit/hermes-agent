@@ -418,6 +418,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
+    context_tokens INTEGER DEFAULT 0,
+    context_window INTEGER DEFAULT 0,
     cwd TEXT,
     git_branch TEXT,
     git_repo_root TEXT,

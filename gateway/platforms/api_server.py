@@ -2610,6 +2610,42 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
+    def _persist_context_usage(self, session_id: Optional[str], usage: Any) -> None:
+        """Best-effort: record this turn's context occupancy on the session row.
+
+        The SSE ``run.completed`` event is the only other carrier of
+        ``context_tokens``/``context_window``, and a client that disconnects
+        (leaves the task window, phone backgrounds) never sees it — the turn
+        still finishes server-side, but the numbers are lost with the stream.
+        Persisting them onto the session row lets any later reader recover the
+        value without a live client.  Never raises: a failed write must not
+        affect the turn.
+        """
+        if not session_id or not isinstance(usage, dict):
+            return
+        try:
+            ctx_tokens = max(0, int(usage.get("context_tokens") or 0))
+            ctx_window = max(0, int(usage.get("context_window") or 0))
+        except (TypeError, ValueError):
+            return
+        if not (ctx_tokens or ctx_window):
+            return  # 0/0 = unknown (compressor sentinel) — never overwrite good values
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET context_tokens = ?, context_window = ? WHERE id = ?",
+                    (ctx_tokens, ctx_window, session_id),
+                ),
+                # Gauge data is cosmetic: never let lock contention stall the
+                # end of a turn (same class as the activity-label writes).
+                patience_s=0.5,
+            )
+        except Exception as exc:
+            logger.debug("Context usage persist failed for %s: %s", session_id, exc)
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -7638,6 +7674,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     _eff_sid = getattr(agent, "session_id", session_id)
                     if isinstance(_eff_sid, str) and _eff_sid:
                         result["session_id"] = _eff_sid
+                    # Local patch (Helm, see task.md Finding #4): persist this
+                    # turn's context-window occupancy onto the session row so a
+                    # remote gauge can recover it after the fact.  The SSE
+                    # usage event is lost whenever the client disconnects
+                    # mid-turn; this write is not.  Best-effort, never raises.
+                    self._persist_context_usage(
+                        _eff_sid if isinstance(_eff_sid, str) and _eff_sid else session_id,
+                        usage,
+                    )
                     # Signal whether context compression occurred during this turn
                     # so _build_response_conversation_history can skip the
                     # prior-concatenation path and store the compressed transcript
