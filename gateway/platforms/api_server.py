@@ -1574,6 +1574,13 @@ class APIServerAdapter(BasePlatformAdapter):
     # should complete the interrupted work rather than acknowledge (#57056).
     interactive_resume: bool = False
 
+    # Run-control state (values are initialized at runtime by
+    # ``_api_runs._initialize_run_state`` in ``__init__``; declared here so
+    # this module's handlers type-check — see api_server_runs.py).
+    _run_statuses: Dict[str, Dict[str, Any]]
+    _active_run_agents: Dict[str, Any]
+    _stopping_run_ids: "set[str]"
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
@@ -2309,6 +2316,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/api/sessions/{session_id}/stop", self._handle_session_stop),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3665,6 +3673,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "session_stop": {"method": "POST", "path": "/api/sessions/{session_id}/stop"},
                 "browser_control_register": {"method": "POST", "path": "/v1/browser-control/register"},
                 "browser_control_ws": {"method": "GET", "path": "/v1/browser-control/ws"},
                 "artifact_upload": {"method": "POST", "path": "/v1/artifacts/upload"},
@@ -5283,6 +5292,64 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         if hasattr(drain_task, "add_done_callback"):
             drain_task.add_done_callback(self._background_tasks.discard)
+
+    async def _handle_session_stop(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/stop — interrupt every live run on a session.
+
+        Local patch (Helm, 2026-09-14 stop incident): the PWA Stop button
+        interrupts via the run-scoped ``/v1/runs/{run_id}/stop``, but the
+        run_id lives only in a browser ref — after a page reload/navigation
+        mid-turn nobody can address the run anymore, and a second message
+        queued behind the session's single-flight turn lease returns 409
+        ``run_not_active`` from the run-scoped endpoint (the queued run has
+        no agent yet). This session-scoped fallback finds every run this
+        gateway process knows about for the session — running, queued, or
+        waiting on the turn lease — and interrupts them all.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+
+        stopped: List[Dict[str, Any]] = []
+        # Snapshot: interrupting mutates _stopping_run_ids, not _run_statuses
+        # keys, but a run can complete concurrently and drop itself from
+        # _active_run_agents between listing and acting. Treat every entry
+        # as potentially-racing; each step re-checks before interrupting.
+        for run_id, status in list(self._run_statuses.items()):
+            if status.get("session_id") != session_id:
+                continue
+            if status.get("status") in {"completed", "failed", "cancelled", "interrupted"}:
+                continue
+            agent = self._active_run_agents.get(run_id)
+            self._set_run_status(run_id, "stopping", last_event="run.stopping")
+            self._stopping_run_ids.add(run_id)
+            if agent is not None:
+                try:
+                    request_hard_interrupt(agent, "Stop requested via session stop")
+                except Exception:
+                    pass
+                _reap_disconnected_agent_processes(
+                    agent, source="api_server_session_stop"
+                )
+            stopped.append({"run_id": run_id, "status": "stopping"})
+
+        logger.info(
+            "[api_server] session stop: %s interrupted %d run(s)%s",
+            session_id,
+            len(stopped),
+            "".join(f" {s['run_id']}" for s in stopped),
+        )
+        return web.json_response(
+            {
+                "session_id": session_id,
+                "stopped": stopped,
+                "count": len(stopped),
+            }
+        )
 
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
@@ -7643,6 +7710,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent_ref[0] = agent
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
+                        # Local patch (Helm session-stop, 2026-09-14): a
+                        # session-scoped stop can land in the gap before this
+                        # registration (run queued/lease-waiting, agent list
+                        # still empty). It marks the run stopping; re-check
+                        # here so the interrupt is honored immediately instead
+                        # of running a full doomed turn. Mirrors the same
+                        # guard in _handle_runs' _run_and_close.
+                        if active_run_id in self._stopping_run_ids:
+                            request_hard_interrupt(
+                                agent, "Stop requested before run start"
+                            )
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
