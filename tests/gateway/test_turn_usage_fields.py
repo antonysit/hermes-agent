@@ -36,7 +36,7 @@ class TestTurnUsageFields:
         }
 
     def test_anchored_figure_preferred_over_last_prompt_tokens(self):
-        from agent.model_metadata import capture_usage_anchor
+        from agent.usage_anchor import capture_usage_anchor
 
         messages = [
             {"role": "user", "content": "hi"},
@@ -56,7 +56,7 @@ class TestTurnUsageFields:
         assert fields["context_window"] == 1050000
 
     def test_stale_anchor_falls_back_to_last_prompt_tokens(self):
-        from agent.model_metadata import capture_usage_anchor
+        from agent.usage_anchor import capture_usage_anchor
 
         messages = [{"role": "user", "content": "hi"}]
         agent = types.SimpleNamespace(
@@ -65,7 +65,10 @@ class TestTurnUsageFields:
             ),
             _usage_anchor=capture_usage_anchor(9000, 10, messages),
         )
-        reloaded = [dict(m) for m in messages]
+        # Anchor identity is a content fingerprint (#99421): a transcript
+        # whose priced message was rewritten (compaction/rewind) fails the
+        # match closed, so the figure falls back to last_prompt_tokens.
+        reloaded = [{"role": "user", "content": "hi (compacted away)"}]
         assert _turn_usage_fields(agent, messages=reloaded)["context_tokens"] == 35019
 
     def test_compression_sentinel_clamps_to_zero(self):
