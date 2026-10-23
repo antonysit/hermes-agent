@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from functools import partial
 import hmac
 import json
+import os
 import re
 import uuid
 
@@ -137,6 +138,18 @@ def schedule_orphan(admitted):
         authority._schedule(ref)
 
 
+def _api_turn_admitted_sources():
+    """Sources an API-door turn may address when the session already exists.
+
+    Upstream default-deny (#98619) admits only the surfaces the API server owns
+    ('api_server', 'bot_room'). The local Helm integration creates sessions tagged
+    'helm' and adopts Telegram-born ones, so those are admitted here too; a
+    deployment can widen further with HERMES_API_TURN_SOURCES (comma-separated)
+    without loosening stock installs."""
+    extra = os.environ.get('HERMES_API_TURN_SOURCES', '')
+    return {'api_server', 'bot_room', 'helm', 'telegram'} | {s.strip() for s in extra.split(',') if s.strip()}
+
+
 def admit_api_steps(adapter, **kwargs):
     # ``/p/<profile>/`` middleware scoped this request; the routed home's authority admits it.
     from gateway.session_authorities import require_active_authority
@@ -171,7 +184,7 @@ def admit_api_steps(adapter, **kwargs):
     # Refuse a foreign-surface target before committing any media for it (a refused
     # admission otherwise retains its image bytes under native-inputs/ forever).
     existing = authority.db.get_session(sid)
-    if existing is not None and existing['source'] not in ('api_server', 'bot_room'):
+    if existing is not None and existing['source'] not in _api_turn_admitted_sources():
         raise RuntimeStoreError('permission_denied')
     if kwargs.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
