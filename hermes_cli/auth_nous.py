@@ -25,7 +25,7 @@ from hermes_cli.auth_constants import (
     DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS, NOUS_AUTH_PATH_INVOKE_JWT, NOUS_BILLING_MANAGE_SCOPE,
     NOUS_DEVICE_CODE_SOURCE, NOUS_INFERENCE_INVOKE_SCOPE, NOUS_INVOKE_JWT_MIN_TTL_SECONDS,
     WELCOME_CLAIM_FLAG, _nous_err, httpx)
-from hermes_cli.guest_handoff import deferred, drain, note_replacement, result_lines
+from hermes_cli.guest_handoff import drain, note_replacement, result_lines
 
 if TYPE_CHECKING:  # annotation-only; the runtime import would be a cycle
     from hermes_cli.auth import ProviderConfig
@@ -414,9 +414,35 @@ _NOUS_SHARED_STATE_KEYS = (
 _SHARED_RENEWAL_KEY = "renewal"
 
 
+def _nous_state_order(a: dict[str, Any], b: dict[str, Any]) -> Optional[int]:
+    """1 when *a* holds the later-ISSUED token pair than *b*, -1 the earlier, 0 tied, None unstamped.
+
+    The forked-grant heal's ordering (``auth_oauth_grants.oauth_pair_order``): JWT ``iat``, then
+    ``obtained_at`` (which also breaks an equal whole-second ``iat``); expiry only orders states
+    lacking an issue stamp, since a later rotation can carry a shorter TTL.
+    A side stamped only by expiry against one stamped only by issue time is a tie (no adopt, no
+    push); JWT states carry both claims, so they always order.
+    """
+    from hermes_cli.auth_oauth_grants import oauth_pair_order
+    return oauth_pair_order(a, b)
+
+
+def _same_known_nous_identity(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """True when *a* and *b* are provably the same identity. An account whose access token carries no
+    JWT ``sub`` is UNKNOWN, never "the same" as another unknown one."""
+    identity = _nous_identity(a)
+    return identity[1] not in (None, "") and identity == _nous_identity(b)
+
+
 def _merge_shared_nous_oauth_state(state: dict[str, Any]) -> bool:
-    """Copy fresher shared OAuth tokens into a profile-local Nous state."""
-    from hermes_cli.auth import _nonempty_str, _parse_iso_timestamp, _read_shared_nous_state
+    """Adopt the shared store's OAuth tokens into a profile-local Nous state when they are NEWER.
+
+    An older shared copy (a failed shared write after this profile refreshed) never overwrites the
+    profile: its refresh token is already redeemed, and replaying it trips the Portal's reuse
+    detection (forced re-login). When the profile is the newer one it is pushed to the shared
+    store instead, so sibling profiles stop reading the stale copy. Caller holds the shared lock.
+    """
+    from hermes_cli.auth import _nonempty_str, _read_shared_nous_state
     shared = _read_shared_nous_state() or {}
     renewed = shared.get(_SHARED_RENEWAL_KEY)
     if isinstance(renewed, dict) and _nous_identity(renewed) == _nous_identity(state):
@@ -424,10 +450,21 @@ def _merge_shared_nous_oauth_state(state: dict[str, Any]) -> bool:
     shared_refresh = shared.get("refresh_token")
     if not _nonempty_str(shared_refresh):
         return False  # a free-tier identity has no refresh token; nothing to merge into an OAuth state
-    shared_access_exp = _parse_iso_timestamp(shared.get("expires_at")) or 0.0
-    local_access_exp = _parse_iso_timestamp(state.get("expires_at")) or 0.0
     refresh_changed = shared_refresh.strip() != str(state.get("refresh_token") or "").strip()
-    if not refresh_changed and not shared_access_exp > local_access_exp:
+    order = _nous_state_order(shared, state)
+    # A quarantined profile has no access token, so its identity reads as unknown: it must still
+    # recover from a sibling's re-login (ca6513542d5), so an empty profile adopts on order alone.
+    known_same = _same_known_nous_identity(shared, state)
+    same = known_same or not _nonempty_str(state.get("access_token"))
+    # Unstamped on both sides: no evidence either way, keep the legacy "a different token wins".
+    # Never across identities: a profile signed in as one account keeps it (profiles are islands).
+    if not (same and (order == 1 or (order is None and refresh_changed))):
+        if order == -1 and refresh_changed and known_same:
+            _oauth_trace(
+                "nous_shared_store_older_than_profile",
+                shared_refresh_token_fp=_token_fingerprint(shared_refresh),
+                refresh_token_fp=_token_fingerprint(state.get("refresh_token")))
+            _write_shared_nous_state(state, renewal=True)
         return False
     for key in _NOUS_SHARED_STATE_KEYS:
         value = shared.get(key)
@@ -463,6 +500,18 @@ def _nous_identity(state: dict[str, Any]) -> tuple[str, Any]:
     return "account", _decode_jwt_claims(state.get("access_token")).get("sub")
 
 
+def _shared_copy_is_newer(held: Optional[dict[str, Any]], state: dict[str, Any], *, same: bool) -> bool:
+    """True when the shared store already holds a NEWER copy of *state*'s account (a renewal never
+    rolls it back to an older, possibly already-redeemed refresh token)."""
+    from hermes_cli.anon_auth import is_guest_state
+    if held is None or is_guest_state(state):
+        return False
+    copy = held if same else held.get(_SHARED_RENEWAL_KEY)
+    if not isinstance(copy, dict) or not _same_known_nous_identity(copy, state):
+        return False
+    return _nous_state_order(copy, state) == 1
+
+
 def _write_shared_nous_state(state: dict[str, Any], *, renewal: bool) -> None:
     """Persist a minimal copy of the Nous OAuth state to the shared store.
 
@@ -487,6 +536,11 @@ def _write_shared_nous_state(state: dict[str, Any], *, renewal: bool) -> None:
             path = _nous_shared_store_path()
             held = _read_shared_nous_state()
             same = held is not None and _nous_identity(held) == _nous_identity(state)
+            if renewal and _shared_copy_is_newer(held, state, same=same):
+                _oauth_trace(
+                    "nous_shared_store_write_skipped_older", path=str(path),
+                    refresh_token_fp=_token_fingerprint(refresh_token))
+                return
             if renewal and held is not None and not same:
                 shared = {**held, _SHARED_RENEWAL_KEY: _nous_shared_shape(state)}
             else:
@@ -499,8 +553,6 @@ def _write_shared_nous_state(state: dict[str, Any], *, renewal: bool) -> None:
             refresh_token_fp=_token_fingerprint(refresh_token))
     except Exception as exc:
         logger.debug("Failed to write shared Nous auth store: %s", exc)
-    # The account is saved everywhere now: hand the replaced guest over (a no-op under a lock).
-    drain()
 
 
 def _read_shared_nous_state() -> Optional[dict[str, Any]]:
@@ -1519,6 +1571,7 @@ def step_up_nous_billing_scope(
         open_browser=open_browser, timeout_seconds=timeout_seconds, on_verification=on_verification)
     _save_active_provider_state("nous", auth_state)
     _mirror_nous_state_best_effort(auth_state)
+    drain()  # a step-up that replaced the free tier hands its apps over
     # Every caller replays the refused billing action next: drop the billing client's 30s token cache
     # here (not per caller) so that replay sends the new token, not the pre-approval one (403 again).
     try:
@@ -1680,17 +1733,17 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
         # model-picker "Skip (keep current)" can restore the user's previous provider.
         with _auth_store_lock():
             prior_active_provider = _load_auth_store().get("active_provider")
-        with deferred() as handoff:  # a replaced free tier hands its apps over once both saves land
-            saved_to = _save_active_provider_state("nous", auth_state)
-            # Mirror to the shared store so other profiles can one-tap import (best-effort inside).
-            _write_shared_nous_state(auth_state, renewal=False)
+        saved_to = _save_active_provider_state("nous", auth_state)
+        # Mirror to the shared store so other profiles can one-tap import (best-effort inside).
+        _write_shared_nous_state(auth_state, renewal=False)
+        handoff = drain()  # a replaced free tier hands its apps over once both saves land
         _sync_nous_pool_from_auth_store()
         from hermes_cli.anon_auth import settle_after_upgrade
         settle_after_upgrade(auth_state)  # a config left on the free tier's route moves to the account
         print()
         print("Login successful!")
         print(f"  Auth state: {saved_to}")
-        for line in (line for view in handoff.results for line in result_lines(view)):
+        for line in (line for view in handoff for line in result_lines(view)):
             print(f"  {line}")
         # Pick the model BEFORE writing the provider to config.yaml so config is never half-updated.
         selected_model = None
